@@ -1,0 +1,308 @@
+---
+title: "EFI: COVID-19 Argentina"
+author: "Garay Santiago, Ivan Escobar, Villavicencio Jonatan, Ibarra Matias"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: yeti
+    df_print: paged
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# 1. Introducción
+
+Este R Markdown contiene el pipeline completo para un proyecto de predicción de **nuevos casos diarios de COVID-19** en **Argentina**, usando el dataset completo de Our World in Data (`owid-covid-data.csv`).
+
+Objetivo: predecir `new_cases` a 14 días con fundamento y medición de la confiabilidad del modelo.
+
+Hipótesis de trabajo: *La incorporación de variables exógenas (tests diarios, porcentaje de población vacunada, medias móviles) mejora la predicción frente a un modelo autoregresivo simple.*
+  
+---
+  
+# 2. Paquetes y carga de datos
+  
+```{r paquetes}
+required <- c(
+  "data.table","dplyr","lubridate","ggplot2","xgboost","Metrics",
+  "zoo","tidyr","scales","patchwork",
+  "mlbench","caret","e1071"
+)
+
+# Detectar paquetes ya instalados
+installed <- rownames(installed.packages())
+
+# Instalar los que faltan
+new <- required[!(required %in% installed)]
+if(length(new)) install.packages(new, dependencies = TRUE)
+
+# Cargar
+lapply(required, library, character.only = TRUE)
+```
+
+---
+
+# 3 carga y filtrado de datos
+```{r filtrado}
+# Definir ruta del archivo
+file_path <- "~/Descargas/owid-covid-data.csv"
+
+# Verificar existencia
+if(!file.exists(file_path)) stop(paste("No encuentro el archivo:", file_path))
+
+# Leer CSV
+raw <- fread(file_path)
+raw <- as.data.frame(raw)
+
+# Ver columnas disponibles
+cat("Columnas disponibles:", paste(names(raw), collapse=", "), "\n")
+
+# Filtrar Argentina y columnas seguras
+columns_to_keep <- c("date", "new_cases", "new_deaths", "total_cases", "total_deaths", "population")
+if("new_tests" %in% names(raw)) columns_to_keep <- c(columns_to_keep, "new_tests")
+
+df <- raw %>%
+  filter(location == "Argentina") %>%
+  select(all_of(columns_to_keep))
+
+# Convertir fecha
+df$date <- as.Date(df$date)
+
+# Reemplazar NA en variables clave
+df <- df %>%
+  mutate(new_cases = ifelse(is.na(new_cases), 0, new_cases),
+         new_deaths = ifelse(is.na(new_deaths), 0, new_deaths),
+         new_tests = ifelse(is.na(new_tests), 0, new_tests))
+
+head(df)
+```
+```{r importancia}
+# Preparamos dataset para regresión
+df_model_caret <- df %>% 
+  drop_na() %>% 
+  select(-date, -population)   # sacamos variables que no queremos modelar
+
+# Control de entrenamiento
+control <- trainControl(method = "cv", number = 10)
+
+# Entrenamos un Random Forest para regresión
+set.seed(123)
+model_rf <- train(
+  new_cases ~ ., 
+  data = df_model_caret,
+  method = "rf",
+  trControl = control,
+  importance = TRUE
+)
+
+# Importancia de variables
+importance <- varImp(model_rf, scale = FALSE)
+importance
+
+# Graficar importancia
+plot(importance, main="Importancia de variables en predicción de nuevos casos (Random Forest)")
+```
+---
+
+# 4. Exploración inicial y gráficos
+
+```{r series}
+pais <- "Argentina"
+
+p1 <- ggplot(df, aes(x=date, y=new_cases)) + geom_line() +
+labs(title = paste("Nuevos casos diarios -", pais), y = "Nuevos casos", x = "Fecha") +
+theme_minimal()
+
+if("new_tests" %in% names(df)){
+p2 <- ggplot(df, aes(x=date, y=new_tests)) + geom_line() +
+labs(title = "Tests diarios", y = "Nuevos tests", x = "Fecha") + theme_minimal()
+p1 / p2
+}else{
+p1
+}
+```
+
+```{r distrib}
+# Distribución y resumen
+summary(df$new_cases)
+qplot(df$new_cases, bins=80) + scale_x_continuous(labels = comma)
+```
+
+# 5. Análisis de correlación y autocorrelación
+
+```{r correlacion}
+df <- df %>%
+mutate(cases_per_100k = ifelse(population>0, new_cases / population * 1e5, NA),
+tests_per_100k = ifelse("new_tests" %in% names(df) & population>0, new_tests / population * 1e5, NA))
+
+corr_vars <- c("new_cases", "new_deaths", "total_cases", "total_deaths", "cases_per_100k")
+if("tests_per_100k" %in% names(df)) corr_vars <- c(corr_vars, "tests_per_100k")
+
+corr_tab <- df %>% select(all_of(corr_vars)) %>% drop_na() %>% cor(use = "pairwise.complete.obs")
+corr_tab
+```
+
+```{r acf}
+# Autocorrelación para new_cases
+acf(df$new_cases, na.action = na.pass, main = "ACF - Nuevos casos")
+```
+
+# 6. Feature engineering (lags y medias móviles)
+
+```{r features}
+lags <- c(1,7,14)
+for(l in lags){
+df[[paste0("lag_cases_", l)]] <- dplyr::lag(df$new_cases, n=l)
+}
+
+df$ma7_cases <- rollmean(df$new_cases, k=7, fill=NA, align="right")
+df$ma14_cases <- rollmean(df$new_cases, k=14, fill=NA, align="right")
+
+df_model <- df %>% filter(!is.na(lag_cases_14)) %>% drop_na(population)
+nrow(df_model)
+```
+
+# 7. División temporal: train / val / test
+
+```{r split}
+# Reservamos 14 días para validación y 14 días para test final (holdout temporal)
+total <- nrow(df_model)
+n_test <- 14
+n_val <- 14
+n_train <- total - n_val - n_test
+
+train <- df_model[1:n_train, ]
+val   <- df_model[(n_train+1):(n_train+n_val), ]
+test  <- df_model[(n_train+n_val+1):total, ]
+
+cat('Fechas entrenamiento:', min(train$date), '->', max(train$date), '\n')
+cat('Fechas validación:', min(val$date), '->', max(val$date), '\n')
+cat('Fechas test:', min(test$date), '->', max(test$date), '\n')
+```
+
+# 8. Modelado: XGBoost (regresión)
+
+```{r xgb}
+features <- c("lag_cases_1","lag_cases_7","lag_cases_14","ma7_cases","ma14_cases","cases_per_100k")
+if("tests_per_100k" %in% names(df_model)) features <- c(features,"tests_per_100k")
+features <- features[features %in% names(train)]
+
+dtrain <- xgb.DMatrix(data = as.matrix(train[, features]), label = train$new_cases)
+dval   <- xgb.DMatrix(data = as.matrix(val[, features]), label = val$new_cases)
+dtest  <- xgb.DMatrix(data = as.matrix(test[, features]), label = test$new_cases)
+
+params <- list(
+objective = "reg:squarederror",  # <- CORRECCIÓN: antes estaba "reg"
+eval_metric = "rmse",
+eta = 0.1,
+max_depth = 6
+)
+
+watchlist <- list(train=dtrain, eval=dval)
+set.seed(123)
+model <- xgb.train(
+params = params,
+data = dtrain,
+nrounds = 500,
+watchlist = watchlist,
+early_stopping_rounds = 20,
+verbose = 0
+)
+
+# Importancia de features
+imp <- xgb.importance(feature_names = features, model = model)
+imp
+```
+
+# 9. Evaluación en validación y test
+
+```{r eval}
+pred_val <- predict(model, dval)
+pred_test <- predict(model, dtest)
+
+res_val <- data.frame(date=val$date, actual=val$new_cases, pred=pred_val)
+res_test <- data.frame(date=test$date, actual=test$new_cases, pred=pred_test)
+
+cat('Validación RMSE:', rmse(res_val$actual, res_val$pred), ' MAE:', mae(res_val$actual, res_val$pred), '\n')
+cat('Test RMSE:', rmse(res_test$actual, res_test$pred), ' MAE:', mae(res_test$actual, res_test$pred), '\n')
+
+res_long <- res_test %>% pivot_longer(cols=c("actual","pred"), names_to="serie", values_to="valor")
+
+ggplot(res_long, aes(x=date, y=valor, color=serie)) + geom_line(size=1) +
+labs(title='Test: casos reales vs predichos', y='Nuevos casos', x='Fecha') + theme_minimal()
+```
+
+# 10. Predicción a futuro (14 días) — enfoque iterativo
+
+```{r forecast}
+h <- 14
+last_data <- df_model[nrow(df_model), ]
+prev_window <- tail(df_model, 30)
+
+future <- data.table(date = seq(last_data$date + 1, by = "day", length.out = h))
+
+for(i in 1:h){
+  
+  # lags
+  lag1 <- if(i==1) tail(prev_window$new_cases,1) else future$pred[i-1]
+  lag7 <- if(nrow(prev_window) >= 7) tail(prev_window$new_cases, 7)[1] else lag1
+  
+  # medias móviles
+  ma7 <- mean(tail(c(prev_window$new_cases, if(i>1) future$pred[1:(i-1)] else NULL),7), na.rm=TRUE)
+  ma14 <- mean(tail(c(prev_window$new_cases, if(i>1) future$pred[1:(i-1)] else NULL),14), na.rm=TRUE)
+  
+  # features calculadas
+  cases_pk <- ifelse(!is.na(last_data$population), lag1 / last_data$population * 1e5, NA)
+  
+  # vector de features dinámico
+  vec <- c(
+    lag_cases_1 = lag1,
+    lag_cases_7 = lag7,
+    ma7_cases = ma7,
+    ma14_cases = ma14,
+    cases_per_100k = cases_pk
+  )
+  if("tests_per_100k" %in% names(df_model)){
+    tests_pk <- tail(prev_window$tests_per_100k,1)
+    vec <- c(vec, tests_per_100k = tests_pk)
+  }
+  
+  # predicción
+  pred_i <- predict(model, xgb.DMatrix(matrix(as.numeric(vec), nrow=1)))
+  future$pred[i] <- pred_i
+  
+  # actualizar ventana prev_window conservando columnas
+  new_row <- prev_window[1,]  # tomar estructura de prev_window
+  new_row[1,] <- NA           # limpiar valores
+  new_row$new_cases <- pred_i
+  new_row$cases_per_100k <- cases_pk
+  if("tests_per_100k" %in% names(prev_window)) new_row$tests_per_100k <- tail(prev_window$tests_per_100k,1)
+  
+  prev_window <- rbind(prev_window, new_row)
+}
+
+# Mostrar forecast
+future
+
+# Gráfico
+ggplot() +
+  geom_line(data = df_model %>% tail(60), aes(x=date, y=new_cases), color="black") +
+  geom_line(data = future, aes(x=date, y=pred), color="blue") +
+  labs(title=paste("Forecast", h, "dias -", pais), y="Nuevos casos", x="Fecha") + theme_minimal()
+
+# Guardar forecast
+fwrite(future, file=paste0("forecast_", pais, "_", h, "d.csv"))
+
+```
+
+# 11. Conclusiones
+
+- Se presentó un pipeline reproducible para predecir nuevos casos diarios en Argentina.
+- El modelo XGBoost con lags y medias móviles ofrece una predicción con error (ver métricas arriba)
+- Limitaciones: calidad de reportes, cambios en políticas de testing, aparición de variantes y efecto de vacunación a largo plazo.
+
+---
